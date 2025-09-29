@@ -1,0 +1,80 @@
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.hooks.base_hook import BaseHook
+import pandas as pd
+from sqlalchemy import create_engine
+from datetime import datetime, timedelta
+import os
+import shutil
+import sys
+import logging
+venv_path = 'path'
+sys.path.insert(0, 'path')
+from openpyxl import load_workbook
+
+IN_DIR = 'path/to/import'
+OUT_DIR = '/path/to/importpg'
+FPROCED_DIR = 'path/to/processed'
+# Функция для проверки наличия файлов и перемещения их
+def check_and_move_files(**kwargs):
+    # Проверка наличия файлов в директории IN
+    files = [f for f in os.listdir(IN_DIR) if os.path.isfile(os.path.join(IN_DIR, f))]
+    if files:
+        # Перемещение файлов в OUT_DIR с переименованием
+        for file in files:
+            src_path = os.path.join(IN_DIR, file)
+            dst_path = os.path.join(OUT_DIR, file)
+            shutil.move(src_path, dst_path)
+        for file_name in files:
+            excel_file_path = os.path.join(OUT_DIR, file_name)
+            df = pd.read_excel(excel_file_path)
+            df = df[df['client_id'].notnull()]
+            df['begin_date'] = pd.to_datetime(df['begin_date'], format='%d.%m.%Y')
+            todays = datetime.now().date()
+            mask_begin = df['begin_date'].dt.date > todays
+            df.loc[mask_begin, 'begin_date'] = todays.strftime("%Y-%m-%d")
+            df['end_date'] = pd.to_datetime(df['end_date'], format='%d.%m.%Y')
+            mask_end = df['end_date'].dt.date <= todays
+            df.loc[mask_end, 'end_date'] = df['end_date']+ ((todays - df['end_date'].dt.date) + timedelta(days=1))
+            df['end_date'] = df['end_date'].dt.strftime("%Y-%m-%d")
+            df['crm_id'] = 1
+            
+            postgres_conn_id = 'conn'
+            conn = BaseHook.get_connection(postgres_conn_id)
+            engine = create_engine (f'postgresql://{conn.login}:{conn.password}@{conn.host}:{conn.port}/{conn.schema}', echo = True)
+            df.to_sql('personal_offers', con=engine,schema='gate', if_exists='append', index=False)
+            logging.info(df['client_id'])
+            
+        for file_name in files:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            name = os.path.splitext(file_name)[0]
+            processed_file_name = f"po_{timestamp}_{name}.xlsx"
+            processed_file_path = os.path.join(FPROCED_DIR, processed_file_name)
+            src_path = os.path.join(OUT_DIR,file_name)
+            shutil.move(src_path, processed_file_path)
+            logging.info('worked 1')
+            
+    else:
+        # Если файлов нет, помещаем информацию в XCom
+        kwargs['ti'].xcom_push(key='files_exist', value=False)
+        logging.info('file not found')
+
+with DAG(
+    dag_id='import_and_process_pofs',
+    default_args={
+        'owner': 'airflow',
+        'retries': 0,
+    },
+    start_date=datetime(2024, 7, 1),
+    catchup=False,
+    schedule=timedelta(minutes=10),
+    max_active_runs=1,
+) as dag:
+
+    check_and_move_task = PythonOperator(
+        task_id='check_and_move_files',
+        python_callable=check_and_move_files,
+        provide_context=True,
+    )
+
+    check_and_move_task
